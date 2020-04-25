@@ -1,0 +1,101 @@
+# Template algorithm for the insiders challenge. Based on an algorithm provided by Leo M
+# The algo uses documented example from: https://www.quantopian.com/docs/data-reference/ownership_aggregated_insider_transactions
+
+from quantopian.algorithm import attach_pipeline, pipeline_output
+
+import quantopian.optimize as opt
+from quantopian.pipeline import Pipeline
+from quantopian.pipeline.data.builtin import USEquityPricing
+from quantopian.pipeline.filters import QTradableStocksUS
+from quantopian.pipeline.domain import US_EQUITIES
+
+import quantopian.pipeline.data.factset.estimates as fe
+
+import pandas as pd
+import numpy as np
+
+def initialize(context):
+    """
+    Called once at the start of the algorithm.
+    """
+    # Normally a contest algo uses the default commission and slippage
+    # This is unique and only required for this 'mini-contest'
+    set_commission(commission.PerShare(cost=0.000, min_trade_cost=0))   
+    set_slippage(slippage.FixedSlippage(spread=0))
+    
+    # Rebalance every day, 1 hour after market open.
+    schedule_function(
+        rebalance,
+        date_rules.every_day(),
+        time_rules.market_open(hours=2),
+    )
+    # Create our dynamic stock selector.
+    attach_pipeline(make_pipeline(context), 'pipeline') 
+    
+    # Record any custom data at the end of each day    
+    schedule_function(record_positions, 
+                      date_rules.every_day(),
+                      time_rules.market_close())
+    
+    
+def create_factor():
+    # Base universe set to the QTradableStocksUS
+    qtu = QTradableStocksUS()
+    
+    fq1_eps_cons = fe.PeriodicConsensus.slice('EPS', 'qf', 1)
+    fq1_eps_cons_up = fq1_eps_cons.up.latest
+    fq1_eps_cons_down = fq1_eps_cons.down.latest
+    
+    alpha_factor = fq1_eps_cons_up - fq1_eps_cons_down
+    
+    screen = qtu & ~alpha_factor.isnull() & alpha_factor.isfinite()
+    
+    return alpha_factor, screen
+
+def make_pipeline(context):  
+    alpha_factor, screen = create_factor()
+    
+    # Winsorize to remove extreme outliers
+    alpha_winsorized = alpha_factor.winsorize(min_percentile=0.01,
+                                              max_percentile=0.99,
+                                              mask=screen)
+    
+    # Zscore and rank to get long and short (positive and negative) alphas to use as weights
+    alpha_rank = alpha_winsorized.rank().zscore()
+    
+    return Pipeline(columns={'alpha_factor': alpha_rank}, 
+                    screen=screen, domain=US_EQUITIES)
+    
+
+def rebalance(context, data): 
+    # Get the alpha factor data from the pipeline output
+    output = pipeline_output('pipeline')
+    alpha_factor = output.alpha_factor
+    log.info(alpha_factor)
+    # Weight securities by their alpha factor
+    # Divide by the abs of total weight to create a leverage of 1
+    weights = alpha_factor / alpha_factor.abs().sum() 
+    
+    # Must use TargetWeights as an objective
+    order_optimal_portfolio(
+        objective=opt.TargetWeights(weights),
+        constraints=[],
+    )
+
+    
+def record_positions(context, data):
+    pos = pd.Series()
+    for position in context.portfolio.positions.values():
+        pos.loc[position.sid] = position.amount
+        
+    pos /= pos.abs().sum()
+    
+    # Show quantiles of the daily holdings distribution
+    # to show if weights are being squashed to equal weight
+    # or whether they have a nice range of sensitivity.
+    quantiles = pos.quantile([.05, .25, .5, .75, .95]) * 100
+    record(q05=quantiles[.05])
+    record(q25=quantiles[.25])
+    record(q50=quantiles[.5])
+    record(q75=quantiles[.75])
+    record(q95=quantiles[.95])
